@@ -2,38 +2,51 @@
 
 ARG terminal. Players log in and type phrases, `/api/unlock` checks them against a Postgres database on the server, through Prisma.
 
-Put the connection string in `.env.local` (it's gitignored):
+## the backend (for whoever's approving the server)
 
-```
-DATABASE_URL=postgres://user:password@localhost:5432/arg
-```
+this bit is for network leadership. it's just the backend, the frontend is further down.
 
-```bash
-npm install                  # also generates the Prisma client into lib/generated
-npx prisma migrate deploy    # creates the tables and the starter rows, run it after every pull
+short version: it's a tiny node app that serves one page and answers one question. "is this phrase (or username + password) a puzzle answer, and if so what text goes with it?" that's it.
 
-npm run dev    # http://localhost:3000
-npm test
-npm run build && npm start
-```
+**what runs**
+- one node process (next.js 16, `npm start`, port 3000 unless you set `PORT`) sitting behind a reverse proxy like nginx
+- one postgres db, connected through the `DATABASE_URL` env var. that's the only thing it talks to. no other outbound calls while it's running, and the font is bundled at build time so players' browsers don't hit google either
+- no accounts, no sessions, no cookies, no browser storage. it doesn't keep anything about visitors
 
-Already have tables from the old `db/schema.sql`? They match the first migration, so tell Prisma instead of running it:
+**the one endpoint:** `POST /api/unlock`
+1. proxy passes the player's ip in `X-Real-IP`
+2. 20 requests a minute per ip, then it returns 429. the counter lives in the process's memory
+3. bodies over 4kb get a 413, every field is capped at 200 chars, and junk input gets a 400 before it ever touches the db
+4. the phrase gets cleaned up (case, spaces, punctuation and accents don't matter), hashed, and looked up in a table the server keeps in memory. hit = that puzzle's text, miss = `{ ok: false }`
+5. if the db is unreachable it returns 503
 
-```bash
-npx prisma migrate resolve --applied 0_init
-```
+**the db**
+- three tables: `entries` (the puzzles), `phrases` (answers that unlock an entry), `logins` (story usernames/passwords)
+- the app only ever reads. it reloads everything every 30 seconds so i can edit puzzles live without a restart. if the db goes down it keeps serving the last copy it loaded
+- what i'd do: give the app a db role with `SELECT` only, and use a different role for `prisma migrate deploy` since that one has to create tables
+- answers and login passwords are plain text in the db. on purpose, they're part of the story. still treat the db like a secret tho, it has every answer in it
 
-To change the tables, edit `prisma/schema.prisma` and run `npx prisma migrate dev --name what-changed` on your machine, then `migrate deploy` on the server. The checks on `kind`, `theme` and `copy` live in the migration SQL because Prisma's schema can't express them. Adding a theme means a new migration that drops and re-adds `entries_theme_check`, like `1_department_themes`; `npm test` fails if the list and `themes.ts` disagree.
+**logs**
+- stdout/stderr only, and only when something's wrong: db errors, a puzzle row with a bad phrase, or a missing proxy header
+- it doesn't log requests or what people type. one exception: if two puzzles get the same answer, the log line names that phrase. so treat the logs as sensitive
 
-## Deploying
+**stuff to know before it goes live**
+- one instance only. the rate limit is in memory so two instances (or serverless) would each count on their own
+- the rate limit trusts `X-Real-IP`. if someone can reach the app without going through the proxy they can fake it and skip the limit. bind it to localhost or firewall it so only the proxy can hit port 3000
+- if that header's missing, everyone shares one bucket and the whole site gets 20 attempts a minute total. it logs a message when that happens in production
+- the login screen is for the story, it's not security. the api takes phrases without logging in
+- a chunked request has no length header and skips the 4kb check, so also set a body limit at the proxy (`client_max_body_size 8k;` in nginx)
+- i haven't load tested it. expecting a hundred players max
 
-Run it as one Node process behind one proxy. The rate limit is in memory, so serverless or several instances won't share it.
+## the frontend (and the ai part)
 
-The proxy has to pass the real client IP, or the rate limit can be faked:
+being upfront, claude code was used to help with these things:
+- the canvas terminal and the typing/input stuff
+- the crt screen effect in webgl (`crt.ts`, built on three.js, with glsl shaders)
+- the spinning ascii emblem (`emblem.ts`)
+- snake, and the drawing code
 
-```nginx
-proxy_set_header X-Real-IP $remote_addr;
-```
+i also used claude code on the rest of the repo to refactor, write tests and review stuff. what the game does and what's in it is on me and the other gms.
 
 ## Adding a puzzle
 
